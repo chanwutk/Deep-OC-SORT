@@ -74,11 +74,8 @@ Input: [e_1, e_2, ..., e_t]  — sequence of L2-normalized ReID embeddings
 Input Projection: Linear(emb_dim, d_model)
   |
   v
-Positional Encoding (learned)
-  |
-  v
 N x Transformer Decoder Block:
-    - Causal (masked) Multi-Head Self-Attention
+    - Causal (masked) Multi-Head Self-Attention + Relative Position Bias
     - Layer Norm (pre-norm)
     - Feed-Forward Network (MLP with GELU)
     - Layer Norm (pre-norm)
@@ -109,6 +106,11 @@ Output: [pred_e_2, pred_e_3, ..., pred_e_{t+1}]
 2. The model is small (~2M params) for real-time tracking efficiency.
 3. Pre-norm transformer (more stable training).
 4. Causal masking ensures each position can only attend to previous positions.
+5. **Relative position bias** (no absolute positional embeddings): Each attention head
+   learns a scalar bias indexed by `d = query_pos - key_pos`, the distance between query
+   and key positions. This means the model encodes "how far back is this observation from
+   the current prediction point" rather than "what is its absolute index in the sequence."
+   This makes the representation translation-invariant in time.
 
 ### Training
 
@@ -149,7 +151,7 @@ During tracking (online), each `KalmanBoxTracker` owns an `AppearanceTracker`:
 ## Files
 
 ### `trackers/integrated_ocsort_embedding/gpt_model.py`
-- `CausalSelfAttention`: Multi-head causal self-attention
+- `CausalSelfAttention`: Multi-head causal self-attention with relative position bias
 - `TransformerBlock`: Pre-norm transformer decoder block
 - `AppearanceGPT(nn.Module)`: The GPT model
 - `AppearanceTracker`: Per-track state object (predict/update pattern)

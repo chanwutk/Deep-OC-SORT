@@ -31,7 +31,14 @@ import torch.nn.functional as F
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal (masked) self-attention."""
+    """Multi-head causal (masked) self-attention with relative position bias.
+
+    Instead of absolute positional embeddings, each attention head learns a
+    bias indexed by the relative distance (i - j) between the query position i
+    and the key position j.  This makes the model position-invariant: a token
+    that is *k* steps before the prediction point always receives the same
+    positional signal, regardless of total sequence length.
+    """
 
     def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
@@ -43,6 +50,10 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
+
+        # Relative position bias: distance d = (query_pos - key_pos) -> per-head scalar
+        # Maximum distance is max_seq_len - 1 (causal, so d >= 0)
+        self.rel_pos_bias = nn.Embedding(max_seq_len, n_heads)
 
         # Causal mask: upper-triangular = -inf
         causal_mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool()
@@ -67,6 +78,15 @@ class CausalSelfAttention(nn.Module):
 
         # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Add relative position bias
+        # rel_dist[i, j] = i - j  (query_pos - key_pos)
+        positions = torch.arange(T, device=x.device)
+        rel_dist = positions.unsqueeze(1) - positions.unsqueeze(0)  # (T, T)
+        rel_dist = rel_dist.clamp(min=0)  # Negative distances masked by causal mask
+        bias = self.rel_pos_bias(rel_dist)  # (T, T, n_heads)
+        bias = bias.permute(2, 0, 1).unsqueeze(0)  # (1, n_heads, T, T)
+        attn = attn + bias
 
         # Apply causal mask
         attn = attn.masked_fill(self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0), float("-inf"))
@@ -142,8 +162,8 @@ class AppearanceGPT(nn.Module):
         # Input projection: emb_dim -> d_model
         self.input_proj = nn.Linear(emb_dim, d_model)
 
-        # Learned positional encoding
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        # Positional encoding is handled by relative position bias inside
+        # CausalSelfAttention — no absolute positional embedding needed.
 
         # Transformer blocks
         self.blocks = nn.ModuleList(
@@ -188,12 +208,9 @@ class AppearanceGPT(nn.Module):
         B, T, _ = emb_seq.shape
         assert T <= self.max_seq_len, f"Sequence length {T} exceeds max_seq_len {self.max_seq_len}"
 
-        # Project input embeddings
-        h = self.input_proj(emb_seq)  # (B, T, d_model)
-
-        # Add positional encoding
-        positions = torch.arange(T, device=emb_seq.device)
-        h = self.drop(h + self.pos_emb(positions))
+        # Project input embeddings (no absolute positional encoding —
+        # relative position bias is applied inside each attention layer)
+        h = self.drop(self.input_proj(emb_seq))  # (B, T, d_model)
 
         # Apply transformer blocks
         for block in self.blocks:
