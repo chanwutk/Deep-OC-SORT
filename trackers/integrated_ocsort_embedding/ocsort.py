@@ -14,6 +14,7 @@ import numpy as np
 from .association import *
 from .embedding import EmbeddingComputer
 from .cmc import CMCComputer
+from .gpt_model import AppearanceTracker
 
 
 def k_previous_obs(observations, cur_age, k):
@@ -205,7 +206,8 @@ class KalmanBoxTracker(object):
         self.velocity = None
         self.delta_t = delta_t
 
-        self.emb = emb
+        # Appearance tracker (mirrors KalmanBoxTracker's predict/update for embeddings)
+        self.appearance = AppearanceTracker(emb=emb)
 
         self.frozen = False
 
@@ -250,11 +252,16 @@ class KalmanBoxTracker(object):
             self.frozen = True
 
     def update_emb(self, emb, alpha=0.9):
-        self.emb = alpha * self.emb + (1 - alpha) * emb
-        self.emb /= np.linalg.norm(self.emb)
+        """Register a new appearance observation (delegates to AppearanceTracker)."""
+        self.appearance.update(emb, alpha=alpha)
+
+    def predict_emb(self):
+        """Predict the next appearance embedding (delegates to AppearanceTracker)."""
+        return self.appearance.predict()
 
     def get_emb(self):
-        return self.emb
+        """Return the current predicted appearance embedding."""
+        return self.appearance.get_emb()
 
     def apply_affine_correction(self, affine):
         m = affine[:, :2]
@@ -347,6 +354,8 @@ class OCSort(object):
         aw_off=False,
         new_kf_off=False,
         grid_off=False,
+        gpt_model_path=None,
+        gpt_off=False,
         **kwargs,
     ):
         """
@@ -373,6 +382,14 @@ class OCSort(object):
         self.aw_off = aw_off
         self.new_kf_off = new_kf_off
         self.grid_off = grid_off
+
+        # GPT-based appearance predictor (shared model for all tracks)
+        self.gpt_off = gpt_off
+        if not gpt_off and gpt_model_path is not None:
+            print(f"Loading GPT appearance model from {gpt_model_path}")
+            AppearanceTracker.load_model(gpt_model_path, grid_off=grid_off)
+        else:
+            AppearanceTracker.set_model(None, grid_off=grid_off)
 
     def update(self, output_results, img_tensor, img_numpy, tag):
         """
@@ -421,8 +438,8 @@ class OCSort(object):
 
         # get predicted locations from existing trackers.
         trks = np.zeros((len(self.trackers), 5))
-        trk_embs = []
         to_del = []
+        valid_trackers = []
         ret = []
         for t, trk in enumerate(trks):
             pos = self.trackers[t].predict()[0]
@@ -430,10 +447,17 @@ class OCSort(object):
             if np.any(np.isnan(pos)):
                 to_del.append(t)
             else:
-                trk_embs.append(self.trackers[t].get_emb())
+                valid_trackers.append(self.trackers[t])
         trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
-        # Shape = (num_trackers, 3, 512) if grid
-        trk_embs = np.array(trk_embs)
+
+        # Predict appearance embeddings (mirrors bbox predict above)
+        # Uses batch_predict for efficiency, but each tracker's state is
+        # updated individually — same as calling predict_emb() on each.
+        appearance_trackers = [trk.appearance for trk in valid_trackers]
+        if not self.embedding_off:
+            AppearanceTracker.batch_predict(appearance_trackers)
+        trk_embs = np.array([trk.get_emb() for trk in valid_trackers])
+
         for t in reversed(to_del):
             self.trackers.pop(t)
 
