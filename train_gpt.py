@@ -30,6 +30,16 @@ from trackers.integrated_ocsort_embedding.gpt_model import AppearanceGPT
 
 
 # ---------------------------------------------------------------------------
+# KITTI MOTS sequence splits
+# ---------------------------------------------------------------------------
+
+KITTI_MOTS_TRAIN_SEQS = ["0000", "0001", "0003", "0004", "0005", "0009",
+                          "0011", "0012", "0015", "0017", "0019", "0020"]
+KITTI_MOTS_VAL_SEQS   = ["0002", "0006", "0007", "0008", "0010",
+                          "0013", "0014", "0016", "0018"]
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -285,6 +295,163 @@ def extract_gt_embeddings(dataset_name, data_dir, split, grid_off, test_dataset=
     return track_sequences
 
 
+def extract_gt_embeddings_kitti_mots(data_dir, split_seqs, grid_off,
+                                      class_filter="all", split_name="train"):
+    """
+    Extract ReID embeddings for KITTI MOTS ground-truth detections with masks.
+
+    Args:
+        data_dir: Root data directory (contains kitti_mots/)
+        split_seqs: List of sequence ID strings (e.g. ["0000", "0001", ...])
+        grid_off: Whether to disable grid patches
+        class_filter: "car" (class 1), "pedestrian" (class 2), or "all"
+        split_name: Name for the split (used in cache filename)
+
+    Returns:
+        List of np.ndarray, each with shape (T, emb_dim) or (T, 3, emb_dim)
+    """
+    import pycocotools.mask as mask_util
+
+    # Cache path
+    cache_dir = os.path.join("cache", "gt_embeddings")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(
+        cache_dir,
+        f"kitti_mots_{split_name}_{'basic' if grid_off else 'grid'}.pkl",
+    )
+
+    if os.path.exists(cache_path):
+        print(f"Loading cached embeddings from {cache_path}")
+        with open(cache_path, "rb") as f:
+            track_sequences = pickle.load(f)
+        print(f"Loaded {len(track_sequences)} track sequences")
+        return track_sequences
+
+    base_dir = os.path.join(data_dir, "kitti_mots", "training")
+    ann_dir = os.path.join(base_dir, "instances_txt")
+    img_dir = os.path.join(base_dir, "image_02")
+
+    # Class ID mapping: 1=car, 2=pedestrian, 10=ignore
+    class_ids = set()
+    if class_filter == "car":
+        class_ids = {1}
+    elif class_filter == "pedestrian":
+        class_ids = {2}
+    else:  # "all"
+        class_ids = {1, 2}
+
+    # Parse annotations: group by (seq, object_id) → list of detections
+    # Also group by (seq, frame_id) for batch processing
+    track_annotations = defaultdict(list)  # (seq, obj_id) → [{frame_id, bbox, rle}]
+    image_detections = defaultdict(list)   # (seq, frame_id) → [{obj_id, bbox, rle}]
+
+    for seq in split_seqs:
+        ann_path = os.path.join(ann_dir, f"{seq}.txt")
+        if not os.path.exists(ann_path):
+            print(f"  WARNING: Annotation file not found: {ann_path}")
+            continue
+
+        with open(ann_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 6:
+                    continue
+                frame_id = int(parts[0])
+                object_id = int(parts[1])
+                class_id = int(parts[2])
+                img_h = int(parts[3])
+                img_w = int(parts[4])
+                rle_string = parts[5]
+
+                # Skip ignore regions
+                if class_id == 10:
+                    continue
+                if class_id not in class_ids:
+                    continue
+
+                # Build RLE dict for pycocotools
+                rle = {"size": [img_h, img_w], "counts": rle_string.encode("utf-8")}
+
+                # Derive bbox: pycocotools toBbox returns [x, y, w, h]
+                bbox_xywh = mask_util.toBbox(rle).tolist()
+                x, y, w, h = bbox_xywh
+                bbox_xyxy = [x, y, x + w, y + h]
+
+                det = {
+                    "frame_id": frame_id,
+                    "bbox": bbox_xyxy,
+                    "rle": rle,
+                }
+                track_annotations[(seq, object_id)].append(det)
+                image_detections[(seq, frame_id)].append({
+                    "track_key": (seq, object_id),
+                    "bbox": bbox_xyxy,
+                    "rle": rle,
+                })
+
+    # Sort each track by frame_id
+    for key in track_annotations:
+        track_annotations[key].sort(key=lambda x: x["frame_id"])
+
+    print(f"Found {len(track_annotations)} tracks across "
+          f"{len(split_seqs)} sequences (class_filter={class_filter})")
+
+    # Initialize embedding computer
+    # Use "mot17" as dataset for model selection (generic ReID)
+    embedder = EmbeddingComputer("mot17", False, grid_off)
+
+    # Process images and extract embeddings
+    track_embeddings = defaultdict(list)  # (seq, obj_id) → [(frame_id, emb)]
+    image_keys = sorted(image_detections.keys())
+
+    print(f"Extracting embeddings for {len(image_keys)} images...")
+    for img_idx, (seq, frame_id) in enumerate(image_keys):
+        if img_idx % 100 == 0:
+            print(f"  Processing image {img_idx + 1}/{len(image_keys)}")
+
+        # Load image
+        img_path = os.path.join(img_dir, seq, f"{frame_id:06d}.png")
+        if not os.path.exists(img_path):
+            print(f"  WARNING: Image not found: {img_path}")
+            continue
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"  WARNING: Failed to load image: {img_path}")
+            continue
+
+        dets = image_detections[(seq, frame_id)]
+        bboxes = np.array([d["bbox"] for d in dets], dtype=np.float32)
+
+        # Decode RLE masks on-the-fly
+        masks = []
+        for d in dets:
+            mask = mask_util.decode(d["rle"])  # (H, W) uint8
+            masks.append(mask)
+
+        tag = f"gt_kitti_{seq}:{frame_id}"
+        embs = embedder.compute_embedding_masked(img, bboxes, masks, tag)
+
+        for i, d in enumerate(dets):
+            track_embeddings[d["track_key"]].append((frame_id, embs[i]))
+
+    # Sort each track's embeddings by frame_id and stack
+    track_sequences = []
+    for key in sorted(track_embeddings.keys()):
+        emb_list = track_embeddings[key]
+        emb_list.sort(key=lambda x: x[0])
+        embeddings = np.stack([e for _, e in emb_list])
+        track_sequences.append(embeddings)
+
+    # Save cache
+    embedder.dump_cache()
+    print(f"Saving embeddings to {cache_path}")
+    with open(cache_path, "wb") as f:
+        pickle.dump(track_sequences, f)
+
+    print(f"Extracted {len(track_sequences)} track sequences")
+    return track_sequences
+
+
 # ---------------------------------------------------------------------------
 # Training Loop
 # ---------------------------------------------------------------------------
@@ -422,9 +589,9 @@ def get_args():
 
     # Data
     parser.add_argument("--dataset", type=str, default="mot17",
-                        choices=["mot17", "mot20", "dance"],
+                        choices=["mot17", "mot20", "dance", "kitti_mots"],
                         help="Dataset name")
-    parser.add_argument("--data_dir", type=str, default="data",
+    parser.add_argument("--data_dir", type=str, default="datasets",
                         help="Root data directory")
     parser.add_argument("--train_split", type=str, default=None,
                         help="Training annotation split (default: auto-select)")
@@ -432,6 +599,9 @@ def get_args():
                         help="Validation annotation split (default: auto-select)")
     parser.add_argument("--grid_off", action="store_true",
                         help="Disable grid patches (use basic 512-dim embeddings)")
+    parser.add_argument("--kitti_mots_class", type=str, default="all",
+                        choices=["car", "pedestrian", "all"],
+                        help="KITTI MOTS class filter (only used with --dataset kitti_mots)")
 
     # Model
     parser.add_argument("--d_model", type=int, default=256,
@@ -481,16 +651,23 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Determine splits
-    if args.train_split is None:
-        if args.dataset in ["mot17", "mot20"]:
-            args.train_split = "train_half"
-        elif args.dataset == "dance":
+    if args.dataset == "kitti_mots":
+        # KITTI MOTS uses sequence-level splits, not annotation file splits
+        if args.train_split is None:
             args.train_split = "train"
-    if args.val_split is None:
-        if args.dataset in ["mot17", "mot20"]:
-            args.val_split = "val_half"
-        elif args.dataset == "dance":
+        if args.val_split is None:
             args.val_split = "val"
+    else:
+        if args.train_split is None:
+            if args.dataset in ["mot17", "mot20"]:
+                args.train_split = "train_half"
+            elif args.dataset == "dance":
+                args.train_split = "train"
+        if args.val_split is None:
+            if args.dataset in ["mot17", "mot20"]:
+                args.val_split = "val_half"
+            elif args.dataset == "dance":
+                args.val_split = "val"
 
     # Determine embedding dimension
     emb_dim = 512 if args.grid_off else 512 * 3  # 1536 for grid mode
@@ -508,24 +685,56 @@ def main():
     print(f"  epochs:     {args.epochs}")
     print(f"  batch_size: {args.batch_size}")
     print(f"  lr:         {args.lr}")
+    if args.dataset == "kitti_mots":
+        print(f"  class:      {args.kitti_mots_class}")
     print(f"{'='*60}\n")
 
     # ---- Extract embeddings ----
-    print("Extracting training embeddings...")
-    train_sequences = extract_gt_embeddings(
-        args.dataset, args.data_dir, args.train_split, args.grid_off
-    )
+    if args.dataset == "kitti_mots":
+        # Resolve sequence lists for KITTI MOTS
+        if args.train_split == "train":
+            train_seqs = KITTI_MOTS_TRAIN_SEQS
+        elif args.train_split == "val":
+            train_seqs = KITTI_MOTS_VAL_SEQS
+        else:
+            train_seqs = args.train_split.split(",")
 
-    # Split into train and validation
-    np.random.seed(42)
-    n_total = len(train_sequences)
-    n_val = max(int(n_total * args.val_ratio), 1)
-    indices = np.random.permutation(n_total)
-    val_indices = indices[:n_val]
-    train_indices = indices[n_val:]
+        if args.val_split == "val":
+            val_seqs = KITTI_MOTS_VAL_SEQS
+        elif args.val_split == "train":
+            val_seqs = KITTI_MOTS_TRAIN_SEQS
+        else:
+            val_seqs = args.val_split.split(",")
 
-    val_sequences = [train_sequences[i] for i in val_indices]
-    train_sequences = [train_sequences[i] for i in train_indices]
+        print("Extracting training embeddings...")
+        train_sequences = extract_gt_embeddings_kitti_mots(
+            args.data_dir, train_seqs, args.grid_off,
+            class_filter=args.kitti_mots_class,
+            split_name=args.train_split,
+        )
+
+        print("Extracting validation embeddings...")
+        val_sequences = extract_gt_embeddings_kitti_mots(
+            args.data_dir, val_seqs, args.grid_off,
+            class_filter=args.kitti_mots_class,
+            split_name=args.val_split,
+        )
+    else:
+        print("Extracting training embeddings...")
+        train_sequences = extract_gt_embeddings(
+            args.dataset, args.data_dir, args.train_split, args.grid_off
+        )
+
+        # Split into train and validation
+        np.random.seed(42)
+        n_total = len(train_sequences)
+        n_val = max(int(n_total * args.val_ratio), 1)
+        indices = np.random.permutation(n_total)
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        val_sequences = [train_sequences[i] for i in val_indices]
+        train_sequences = [train_sequences[i] for i in train_indices]
 
     print(f"Train: {len(train_sequences)} tracks, Val: {len(val_sequences)} tracks")
 
