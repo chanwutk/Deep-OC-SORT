@@ -44,6 +44,8 @@ def get_main_args():
     parser.add_argument("--aw_param", type=float, default=0.5)
     parser.add_argument("--new_kf_off", action="store_true")
     parser.add_argument("--grid_off", action="store_true")
+    parser.add_argument("--gpt_model_path", type=str, default=None, help="Path to GPT appearance model")
+    parser.add_argument("--gpt_off", action="store_true", help="Disable GPT appearance predictor")
     args = parser.parse_args()
 
     if args.dataset == "mot17":
@@ -101,6 +103,8 @@ def main():
         aw_param=args.aw_param,
         new_kf_off=args.new_kf_off,
         grid_off=args.grid_off,
+        gpt_model_path=args.gpt_model_path,
+        gpt_off=args.gpt_off,
     )
     tracker = tracker_module.ocsort.OCSort(**oc_sort_args)
     results = {}

@@ -42,7 +42,7 @@ class EmbeddingComputer:
             h, w = image.shape[2:]
 
         bbox = np.array(bbox)
-        bbox = bbox.astype(np.int)
+        bbox = bbox.astype(np.int64)
         if bbox[0] < 0 or bbox[1] < 0 or bbox[2] > w or bbox[3] > h:
             # Faulty Patch Correction
             bbox[0] = np.clip(bbox[0], 0, None)
@@ -157,6 +157,101 @@ class EmbeddingComputer:
         self.cache[tag] = embs
         return embs
 
+    def compute_embedding_masked(self, img, bbox, masks, tag):
+        """Compute embeddings with binary mask applied to each crop.
+
+        Same as compute_embedding() but applies a per-detection binary mask
+        to zero out background pixels before feeding to the model.
+
+        Args:
+            img: BGR image as np.ndarray (H, W, 3)
+            bbox: (N, 4) array of [x1, y1, x2, y2] bounding boxes
+            masks: list of N binary masks, each full-image (H, W) uint8 arrays,
+                   or None to fall back to compute_embedding()
+            tag: cache tag string "prefix:frame_id"
+
+        Returns:
+            (N, emb_dim) or (N, 3, emb_dim) embeddings
+        """
+        if masks is None:
+            return self.compute_embedding(img, bbox, tag)
+
+        if self.cache_name != tag.split(":")[0]:
+            self.load_cache(tag.split(":")[0])
+
+        if tag in self.cache:
+            embs = self.cache[tag]
+            if embs.shape[0] != bbox.shape[0]:
+                raise RuntimeError(
+                    "ERROR: The number of cached embeddings don't match the "
+                    "number of detections.\nWas the detector model changed? Delete cache if so."
+                )
+            return embs
+
+        if self.model is None:
+            self.initialize_model()
+
+        # Generate masked crops
+        h, w = img.shape[:2]
+        results = np.round(bbox).astype(np.int32)
+        results[:, 0] = results[:, 0].clip(0, w)
+        results[:, 1] = results[:, 1].clip(0, h)
+        results[:, 2] = results[:, 2].clip(0, w)
+        results[:, 3] = results[:, 3].clip(0, h)
+
+        crops = []
+        for i, p in enumerate(results):
+            crop = img[p[1]:p[3], p[0]:p[2]].copy()
+            # Apply mask: zero out background pixels
+            mask_crop = masks[i][p[1]:p[3], p[0]:p[2]]
+            crop = crop * mask_crop[:, :, np.newaxis]
+
+            if self.grid_off:
+                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                crop = cv2.resize(crop, self.crop_size, interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                if self.normalize:
+                    crop /= 255
+                    crop -= np.array((0.485, 0.456, 0.406))
+                    crop /= np.array((0.229, 0.224, 0.225))
+                crop = torch.as_tensor(crop.transpose(2, 0, 1))
+                crop = crop.unsqueeze(0)
+                crops.append(crop)
+            else:
+                # For grid mode, write the masked crop back to img temporarily
+                # and use the existing grid patch extraction
+                # Create a temporary image with just this masked crop
+                crop_tensor = self.get_horizontal_split_patches(
+                    img * self._full_mask(masks[i])[:, :, np.newaxis],
+                    bbox[i], tag, i)
+                crops.append(crop_tensor)
+
+        crops = torch.cat(crops, dim=0)
+
+        # Create embeddings and l2 normalize them
+        embs = []
+        for idx in range(0, len(crops), self.max_batch):
+            batch_crops = crops[idx:idx + self.max_batch]
+            batch_crops = batch_crops.cuda()
+            with torch.no_grad():
+                batch_embs = self.model(batch_crops)
+            embs.extend(batch_embs)
+        embs = torch.stack(embs)
+        embs = torch.nn.functional.normalize(embs, dim=-1)
+
+        if not self.grid_off:
+            embs = embs.reshape(bbox.shape[0], -1, embs.shape[-1])
+        embs = embs.cpu().numpy()
+
+        self.cache[tag] = embs
+        return embs
+
+    @staticmethod
+    def _full_mask(mask):
+        """Ensure mask is uint8 with values 0/1."""
+        if mask.dtype != np.uint8:
+            return mask.astype(np.uint8)
+        return mask
+
     def initialize_model(self):
         if self.dataset == "mot17":
             if self.test_dataset:
@@ -187,7 +282,7 @@ class EmbeddingComputer:
         validation.
         """
         model = torchreid.models.build_model(name="osnet_ain_x1_0", num_classes=2510, loss="softmax", pretrained=False)
-        sd = torch.load("external/weights/osnet_ain_ms_d_c.pth.tar")["state_dict"]
+        sd = torch.load("external/weights/osnet_ain_ms_d_c.pth.tar", weights_only=False)["state_dict"]
         new_state_dict = OrderedDict()
         for k, v in sd.items():
             name = k[7:]  # remove `module.`

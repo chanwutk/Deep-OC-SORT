@@ -1,0 +1,8 @@
+/external
+/datasets
+/cache
+/checkpoints
+
+__pycache__
+venv
+*.zip
